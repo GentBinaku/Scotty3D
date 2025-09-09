@@ -355,21 +355,62 @@ void Pipeline<p, P, flags>::rasterize_line(
 	if constexpr ((flags & PipelineMask_Interp) != Pipeline_Interp_Flat) {
 		assert(0 && "rasterize_line should only be invoked in flat interpolation mode.");
 	}
-	// A1T2: rasterize_line
 
-	// TODO: Check out the block comment above this function for more information on how to fill in
-	// this function!
-	// The OpenGL specification section 3.5 may also come in handy.
+	// Find major axis 
 
-	{ // As a placeholder, draw a point in the middle of the line:
-		//(remove this code once you have a real implementation)
-		Fragment mid;
-		mid.fb_position = (va.fb_position + vb.fb_position) / 2.0f;
-		mid.attributes = va.attributes;
-		mid.derivatives.fill(Vec2(0.0f, 0.0f));
-		emit_fragment(mid);
+	// Find delta
+	float delta_x = std::abs(vb.fb_position.x - va.fb_position.x);
+	float delta_y = std::abs(vb.fb_position.y - va.fb_position.y);
+
+	// Major axis
+	int i, j; 
+	if (delta_x >= delta_y) {
+    	// x-major line
+    	i = 0; // x is major
+    	j = 1; // y is minor
+	} else {
+    	// y-major line
+    	i = 1; // y is major
+    	j = 0; // x is minor
 	}
 
+	// Start from bottom to top
+	Vec3 pa = va.fb_position;
+	Vec3 pb = vb.fb_position;
+
+	if(pa[i] > pb[i])
+	{
+		std::swap(pa, pb);
+	}
+
+	// Start from int values, not on any border of the diamond
+	// I think this is wrong
+	int t1 = std::floor(pa[i]);
+	int t2 = std::floor(pb[i]);
+
+	if(t1 >= t2)
+	{
+		// Because we use swap this case should not happen
+		return;
+	}
+
+	Fragment frag;
+	for(int u = t1; u <= t2; u++) 
+	{
+		// Find t from p = t*(pb - pa) + pa
+    float t = (float) (u + 0.5 - pa[i]) / (pb[i] - pa[i]);
+
+    float v = (float) t * (pb[j] - pa[j]) + pa[j];
+    float z = (float) t * (pb[2] - pa[2]) + pa[2];
+
+    frag.fb_position.data[i] = std::floor(u) + 0.5f;
+		frag.fb_position.data[j] = std::floor(v) + 0.5f; 
+		frag.fb_position.data[2] = z;
+		frag.attributes = va.attributes;
+
+		// What should I do now?
+		emit_fragment(frag);
+	}
 }
 
 /*
@@ -409,38 +450,107 @@ void Pipeline<p, P, flags>::rasterize_line(
  *  This is pretty tricky to get exactly right!
  *
  */
+namespace {
+	inline int orient2D(const Vec3& a, const Vec3& b, const Vec3& c)
+	{
+    	// Returns positive if c is to the left of ab (counter-clockwise)
+    	return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+	}
+}
+
 template<PrimitiveType p, class P, uint32_t flags>
 void Pipeline<p, P, flags>::rasterize_triangle(
-	ClippedVertex const& va, ClippedVertex const& vb, ClippedVertex const& vc,
-	std::function<void(Fragment const&)> const& emit_fragment) {
-	// NOTE: it is okay to restructure this function to allow these tasks to use the
-	//  same code paths. Be aware, however, that all of them need to remain working!
-	//  (e.g., if you break Flat while implementing Correct, you won't get points
-	//   for Flat.)
-	if constexpr ((flags & PipelineMask_Interp) == Pipeline_Interp_Flat) {
-		// A1T3: flat triangles
-		// TODO: rasterize triangle (see block comment above this function).
+    ClippedVertex const& va, ClippedVertex const& vb, ClippedVertex const& vc,
+    std::function<void(Fragment const&)> const& emit_fragment) {
 
-		// As a placeholder, here's code that draws some lines:
-		//(remove this and replace it with a real solution)
-		Pipeline<PrimitiveType::Lines, P, flags>::rasterize_line(va, vb, emit_fragment);
-		Pipeline<PrimitiveType::Lines, P, flags>::rasterize_line(vb, vc, emit_fragment);
-		Pipeline<PrimitiveType::Lines, P, flags>::rasterize_line(vc, va, emit_fragment);
-	} else if constexpr ((flags & PipelineMask_Interp) == Pipeline_Interp_Smooth) {
-		// A1T5: screen-space smooth triangles
-		// TODO: rasterize triangle (see block comment above this function).
+    Vec3 pa = va.fb_position;
+    Vec3 pb = vb.fb_position;
+    Vec3 pc = vc.fb_position;
 
-		// As a placeholder, here's code that calls the Flat interpolation version of the function:
-		//(remove this and replace it with a real solution)
-		Pipeline<PrimitiveType::Lines, P, (flags & ~PipelineMask_Interp) | Pipeline_Interp_Flat>::rasterize_triangle(va, vb, vc, emit_fragment);
-	} else if constexpr ((flags & PipelineMask_Interp) == Pipeline_Interp_Correct) {
-		// A1T5: perspective correct triangles
-		// TODO: rasterize triangle (block comment above this function).
+    // Compute triangle bounding box
+    int minX = std::floor(std::min(pa.x, std::min(pb.x, pc.x)));
+    int minY = std::floor(std::min(pa.y, std::min(pb.y, pc.y)));
+    int maxX = std::ceil(std::max(pa.x, std::max(pb.x, pc.x)));
+    int maxY = std::ceil(std::max(pa.y, std::max(pb.y, pc.y)));
 
-		// As a placeholder, here's code that calls the Screen-space interpolation function:
-		//(remove this and replace it with a real solution)
-		Pipeline<PrimitiveType::Lines, P, (flags & ~PipelineMask_Interp) | Pipeline_Interp_Smooth>::rasterize_triangle(va, vb, vc, emit_fragment);
-	}
+    // Correct orient2D function for 2D cross product
+    auto orient2D = [](const Vec3& a, const Vec3& b, const Vec3& c) -> float {
+        return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    };
+
+    // Pre-compute the full triangle area
+    float area = orient2D(pa, pb, pc);
+    
+    // Skip degenerate triangles
+    if (std::abs(area) <= std::numeric_limits<float>::epsilon()) return;
+
+    // Make sure the winding order is consistent (positive area)
+    bool reverse_winding = (area < 0);
+    if (reverse_winding) {
+        std::swap(pb, pc);
+        area = -area;
+    }
+
+    for(int y = minY; y <= maxY; y++) {
+        for(int x = minX; x <= maxX; x++) {
+            // Sample at pixel centers
+            Vec3 sample(x + 0.5f, y + 0.5f, 0.0f);
+            
+            // Compute barycentric coordinates
+            float w0 = orient2D(pb, pc, sample);
+            float w1 = orient2D(pc, pa, sample);
+            float w2 = orient2D(pa, pb, sample);
+            
+            // Check if the point is inside the triangle
+            // Use >= for proper edge handling
+            if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
+                // Normalize to get actual barycentric coordinates
+                float lambda0 = w0 / area;
+                float lambda1 = w1 / area;
+                float lambda2 = w2 / area;
+                
+                // Create fragment at pixel center position
+                Fragment frag;
+                frag.fb_position.x = x + 0.5f;
+                frag.fb_position.y = y + 0.5f;
+                
+                // Always interpolate z linearly (regardless of interpolation mode)
+                frag.fb_position.z = lambda0 * pa.z + lambda1 * pb.z + lambda2 * pc.z; 
+                
+                // Handle attributes based on interpolation mode
+                if constexpr ((flags & PipelineMask_Interp) == Pipeline_Interp_Flat) {
+          					frag.attributes = va.attributes;
+                } 
+                else if constexpr ((flags & PipelineMask_Interp) == Pipeline_Interp_Smooth) {
+                    // Smooth shading - linear interpolation
+                    for (uint32_t i = 0; i < va.attributes.max_size(); ++i) {
+                        frag.attributes[i] = lambda0 * va.attributes[i] + 
+                                            lambda1 * vb.attributes[i] + 
+                                            lambda2 * vc.attributes[i];
+                    }
+                } 
+                else if constexpr ((flags & PipelineMask_Interp) == Pipeline_Interp_Correct) {
+                    // Perspective-correct interpolation
+                    float wa = 1.0f / va.inv_w;
+                    float wb = 1.0f / vb.inv_w;
+                    float wc = 1.0f / vc.inv_w;
+                    
+                    // Compute the perspective-correct denominator
+                    float w_interp = 1.0f / (lambda0 * wa + lambda1 * wb + lambda2 * wc);
+                    
+                    // Perspective-correct attributes
+                    for (uint32_t i = 0; i < va.attributes.max_size(); ++i) {
+                        frag.attributes[i] = w_interp * (lambda0 * va.attributes[i] * wa + 
+                                                        lambda1 * vb.attributes[i] * wb + 
+                                                        lambda2 * vc.attributes[i] * wc);
+                    }
+                }
+                
+                // Emit the fragment
+                emit_fragment(frag);
+            }
+        }
+    }
 }
 
 //-------------------------------------------------------------------------
