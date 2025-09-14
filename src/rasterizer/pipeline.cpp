@@ -139,9 +139,13 @@ void Pipeline<primitive_type, Program, flags>::run(std::vector<Vertex> const& ve
 			// "Never" means the depth test never passes.
 			continue; //discard this fragment
 		} else if constexpr ((flags & PipelineMask_Depth) == Pipeline_Depth_Less) {
-			// "Less" means the depth test passes when the new fragment has depth less than the stored depth.
-			// A1T4: Depth_Less
-			// TODO: implement depth test! We want to only emit fragments that have a depth less than the stored depth, hence "Depth_Less".
+			if (f.fb_position.z < fb_depth) {
+    			fb_depth = f.fb_position.z;
+    			// update color here!
+			} else {
+    			continue;
+			}
+			
 		} else {
 			static_assert((flags & PipelineMask_Depth) <= Pipeline_Depth_Always, "Unknown depth test flag.");
 		}
@@ -162,14 +166,9 @@ void Pipeline<primitive_type, Program, flags>::run(std::vector<Vertex> const& ve
 			if constexpr ((flags & PipelineMask_Blend) == Pipeline_Blend_Replace) {
 				fb_color = sf.color;
 			} else if constexpr ((flags & PipelineMask_Blend) == Pipeline_Blend_Add) {
-				// A1T4: Blend_Add
-				// TODO: framebuffer color should have fragment color multiplied by fragment opacity added to it.
-				fb_color = sf.color; //<-- replace this line
+				fb_color += sf.color * sf.opacity;
 			} else if constexpr ((flags & PipelineMask_Blend) == Pipeline_Blend_Over) {
-				// A1T4: Blend_Over
-				// TODO: set framebuffer color to the result of "over" blending (also called "alpha blending") the fragment color over the framebuffer color, using the fragment's opacity
-				// 		 You may assume that the framebuffer color has its alpha premultiplied already, and you just want to compute the resulting composite color
-				fb_color = sf.color; //<-- replace this line
+				fb_color = sf.color * sf.opacity + fb_color * (1.0f - sf.opacity);
 			} else {
 				static_assert((flags & PipelineMask_Blend) <= Pipeline_Blend_Over, "Unknown blending flag.");
 			}
@@ -467,86 +466,141 @@ void Pipeline<p, P, flags>::rasterize_triangle(
     Vec3 pb = vb.fb_position;
     Vec3 pc = vc.fb_position;
 
-    // Compute triangle bounding box
     int minX = std::floor(std::min(pa.x, std::min(pb.x, pc.x)));
     int minY = std::floor(std::min(pa.y, std::min(pb.y, pc.y)));
     int maxX = std::ceil(std::max(pa.x, std::max(pb.x, pc.x)));
     int maxY = std::ceil(std::max(pa.y, std::max(pb.y, pc.y)));
 
-    // Correct orient2D function for 2D cross product
     auto orient2D = [](const Vec3& a, const Vec3& b, const Vec3& c) -> float {
         return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
     };
 
-    // Pre-compute the full triangle area
     float area = orient2D(pa, pb, pc);
-    
-    // Skip degenerate triangles
     if (std::abs(area) <= std::numeric_limits<float>::epsilon()) return;
 
-    // Make sure the winding order is consistent (positive area)
-    bool reverse_winding = (area < 0);
-    if (reverse_winding) {
+    if (area < 0) {
         std::swap(pb, pc);
         area = -area;
     }
 
-    for(int y = minY; y <= maxY; y++) {
-        for(int x = minX; x <= maxX; x++) {
-            // Sample at pixel centers
+    // Analytical barycentric derivatives
+    float d_lambda0_dx = - (pc.y - pb.y) / area;
+    float d_lambda0_dy =   (pc.x - pb.x) / area;
+    float d_lambda1_dx = - (pa.y - pc.y) / area;
+    float d_lambda1_dy =   (pa.x - pc.x) / area;
+    float d_lambda2_dx = - (pb.y - pa.y) / area;
+    float d_lambda2_dy =   (pb.x - pa.x) / area;
+
+    // Helper for left/top edge rule
+    auto is_top_left = [](const Vec3& v0, const Vec3& v1) {
+        if (v0.y == v1.y) {
+            // Horizontal edge: left if x increasing
+            return v0.x > v1.x;
+        } else {
+            // Non-horizontal: top if y increasing
+            return v0.y < v1.y;
+        }
+    };
+
+    // Rasterize pixel centers
+    for (int y = minY; y <= maxY; y++) {
+        for (int x = minX; x <= maxX; x++) {
             Vec3 sample(x + 0.5f, y + 0.5f, 0.0f);
-            
-            // Compute barycentric coordinates
             float w0 = orient2D(pb, pc, sample);
             float w1 = orient2D(pc, pa, sample);
             float w2 = orient2D(pa, pb, sample);
-            
-            // Check if the point is inside the triangle
-            // Use >= for proper edge handling
-            if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
-                // Normalize to get actual barycentric coordinates
+
+            // Left/top edge rule
+            bool on_edge0 = (w0 == 0);
+            bool on_edge1 = (w1 == 0);
+            bool on_edge2 = (w2 == 0);
+
+            bool edge0_incl = on_edge0 && is_top_left(pb, pc);
+            bool edge1_incl = on_edge1 && is_top_left(pc, pa);
+            bool edge2_incl = on_edge2 && is_top_left(pa, pb);
+
+            if ((w0 > 0 || edge0_incl) &&
+                (w1 > 0 || edge1_incl) &&
+                (w2 > 0 || edge2_incl)) {
+
                 float lambda0 = w0 / area;
                 float lambda1 = w1 / area;
                 float lambda2 = w2 / area;
-                
-                // Create fragment at pixel center position
+
                 Fragment frag;
-                frag.fb_position.x = x + 0.5f;
-                frag.fb_position.y = y + 0.5f;
-                
-                // Always interpolate z linearly (regardless of interpolation mode)
-                frag.fb_position.z = lambda0 * pa.z + lambda1 * pb.z + lambda2 * pc.z; 
-                
-                // Handle attributes based on interpolation mode
+                frag.fb_position.x = sample.x;
+                frag.fb_position.y = sample.y;
+                frag.fb_position.z = lambda0 * pa.z + lambda1 * pb.z + lambda2 * pc.z;
+
+
                 if constexpr ((flags & PipelineMask_Interp) == Pipeline_Interp_Flat) {
-          					frag.attributes = va.attributes;
-                } 
+                    frag.attributes = va.attributes;
+          					for(Vec2& derivative : frag.derivatives)
+          					{
+          								derivative.x = 0;
+          								derivative.y = 0;
+          					}
+                }
                 else if constexpr ((flags & PipelineMask_Interp) == Pipeline_Interp_Smooth) {
-                    // Smooth shading - linear interpolation
-                    for (uint32_t i = 0; i < va.attributes.max_size(); ++i) {
-                        frag.attributes[i] = lambda0 * va.attributes[i] + 
-                                            lambda1 * vb.attributes[i] + 
-                                            lambda2 * vc.attributes[i];
+                    for (uint32_t i = 0; i < FA; ++i) {
+                        frag.attributes[i] = lambda0 * va.attributes[i]
+                                           + lambda1 * vb.attributes[i]
+                                           + lambda2 * vc.attributes[i];
+          					}
+
+
+                    for (uint32_t i = 0; i < FD; ++i) {
+                        frag.derivatives[i].x = d_lambda0_dx * va.attributes[i]
+                                              + d_lambda1_dx * vb.attributes[i]
+                                              + d_lambda2_dx * vc.attributes[i];
+                        frag.derivatives[i].y = d_lambda0_dy * va.attributes[i]
+                                              + d_lambda1_dy * vb.attributes[i]
+                                              + d_lambda2_dy * vc.attributes[i];
                     }
-                } 
+                }
                 else if constexpr ((flags & PipelineMask_Interp) == Pipeline_Interp_Correct) {
-                    // Perspective-correct interpolation
                     float wa = 1.0f / va.inv_w;
                     float wb = 1.0f / vb.inv_w;
                     float wc = 1.0f / vc.inv_w;
-                    
-                    // Compute the perspective-correct denominator
-                    float w_interp = 1.0f / (lambda0 * wa + lambda1 * wb + lambda2 * wc);
-                    
-                    // Perspective-correct attributes
-                    for (uint32_t i = 0; i < va.attributes.max_size(); ++i) {
-                        frag.attributes[i] = w_interp * (lambda0 * va.attributes[i] * wa + 
-                                                        lambda1 * vb.attributes[i] * wb + 
-                                                        lambda2 * vc.attributes[i] * wc);
+
+                    float denom = lambda0 * wa + lambda1 * wb + lambda2 * wc;
+                    float w_interp = 1.0f / denom;
+
+                    for (uint32_t i = 0; i < FA; ++i) {
+                        float attrib_num = lambda0 * va.attributes[i] * wa
+                                         + lambda1 * vb.attributes[i] * wb
+                                         + lambda2 * vc.attributes[i] * wc;
+                        frag.attributes[i] = w_interp * attrib_num;
+                    }
+
+                    // Finite difference for derivatives
+                    Vec3 sample_right(sample.x + 1.0f, sample.y, 0.0f);
+                    float wr0 = orient2D(pb, pc, sample_right) / area;
+                    float wr1 = orient2D(pc, pa, sample_right) / area;
+                    float wr2 = orient2D(pa, pb, sample_right) / area;
+                    float denom_r = wr0 * wa + wr1 * wb + wr2 * wc;
+                    float w_interp_r = 1.0f / denom_r;
+                    for (uint32_t i = 0; i < FD; ++i) {
+                        float attrib_num_r = wr0 * va.attributes[i] * wa
+                                           + wr1 * vb.attributes[i] * wb
+                                           + wr2 * vc.attributes[i] * wc;
+                        float attr_right = w_interp_r * attrib_num_r;
+
+                        Vec3 sample_up(sample.x, sample.y + 1.0f, 0.0f);
+                        float wu0 = orient2D(pb, pc, sample_up) / area;
+                        float wu1 = orient2D(pc, pa, sample_up) / area;
+                        float wu2 = orient2D(pa, pb, sample_up) / area;
+                        float denom_u = wu0 * wa + wu1 * wb + wu2 * wc;
+                        float w_interp_u = 1.0f / denom_u;
+                        float attrib_num_u = wu0 * va.attributes[i] * wa
+                                           + wu1 * vb.attributes[i] * wb
+                                           + wu2 * vc.attributes[i] * wc;
+                        float attr_up = w_interp_u * attrib_num_u;
+
+                        frag.derivatives[i].x = attr_right - frag.attributes[i];
+                        frag.derivatives[i].y = attr_up - frag.attributes[i];
                     }
                 }
-                
-                // Emit the fragment
                 emit_fragment(frag);
             }
         }
