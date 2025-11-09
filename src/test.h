@@ -10,6 +10,7 @@
 #include <string>
 #include <optional>
 #include <memory>
+#include <cstdint>
 
 class Scene;
 class Halfedge_Mesh;
